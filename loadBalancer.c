@@ -11,6 +11,8 @@
 #define MAX_SERVERS 3
 #define PORT 9000
 #define BUFFER_SIZE 4096
+#define MAX_CLIENTS 100
+#define MAX_CONNECTIONS_PER_CLIENT 5
 
 typedef struct {
     char ip[16];
@@ -18,20 +20,78 @@ typedef struct {
     int active_connections;
 } Server;
 
+typedef struct {
+    char client_ip[16];
+    int connection_count;
+} ClientRateLimit;
+
 Server servers[MAX_SERVERS] = {
     {"127.0.0.1", 8001, 0},
     {"127.0.0.1", 8002, 0},
     {"127.0.0.1", 8003, 0}
 };
 
+ClientRateLimit client_limits[MAX_CLIENTS];
+int client_limits_count = 0;
+
 typedef struct {
     int fd;
     int peer_fd;
     int server_index;
+    char client_ip[16];
 } Conn;
 
 int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+}
+
+// Rate limiting: check if client can connect
+int check_rate_limit(const char *client_ip) {
+    for (int i = 0; i < client_limits_count; i++) {
+        if (strcmp(client_limits[i].client_ip, client_ip) == 0) {
+            if (client_limits[i].connection_count >= MAX_CONNECTIONS_PER_CLIENT) {
+                printf("⚠️  Rate limit exceeded for client %s (current: %d)\n", 
+                       client_ip, client_limits[i].connection_count);
+                return 0; // blocked
+            }
+            client_limits[i].connection_count++;
+            return 1; // allowed
+        }
+    }
+
+    // New client
+    if (client_limits_count < MAX_CLIENTS) {
+        strcpy(client_limits[client_limits_count].client_ip, client_ip);
+        client_limits[client_limits_count].connection_count = 1;
+        client_limits_count++;
+        printf("✓ New client %s added (limit: %d/%d)\n", 
+               client_ip, 1, MAX_CONNECTIONS_PER_CLIENT);
+        return 1; // allowed
+    }
+
+    printf("⚠️  Max clients reached, rejecting %s\n", client_ip);
+    return 0; // max clients reached
+}
+
+// Decrement connection count when client disconnects
+void decrement_rate_limit(const char *client_ip) {
+    for (int i = 0; i < client_limits_count; i++) {
+        if (strcmp(client_limits[i].client_ip, client_ip) == 0) {
+            client_limits[i].connection_count--;
+            if (client_limits[i].connection_count == 0) {
+                // Remove client entry
+                for (int j = i; j < client_limits_count - 1; j++) {
+                    client_limits[j] = client_limits[j + 1];
+                }
+                client_limits_count--;
+                printf("✓ Client %s removed from tracking\n", client_ip);
+            } else {
+                printf("✓ Client %s connection count: %d\n", 
+                       client_ip, client_limits[i].connection_count);
+            }
+            break;
+        }
+    }
 }
 
 // greedy: least connections
@@ -94,8 +154,21 @@ int main() {
 
             // NEW CLIENT
             if (events[i].data.fd == listen_fd) {
-                int client_fd = accept(listen_fd, NULL, NULL);
+                struct sockaddr_in client_addr = {0};
+                socklen_t addr_len = sizeof(client_addr);
+                
+                int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
                 if (client_fd < 0) continue;
+
+                // Extract client IP
+                char client_ip[16];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+
+                // Apply rate limiting
+                if (!check_rate_limit(client_ip)) {
+                    close(client_fd);
+                    continue;
+                }
 
                 set_nonblocking(client_fd);
 
@@ -103,6 +176,7 @@ int main() {
                 int backend_fd = connect_backend(server_index);
 
                 if (backend_fd < 0) {
+                    decrement_rate_limit(client_ip);
                     close(client_fd);
                     continue;
                 }
@@ -116,10 +190,12 @@ int main() {
                 c1->fd = client_fd;
                 c1->peer_fd = backend_fd;
                 c1->server_index = server_index;
+                strcpy(c1->client_ip, client_ip);
 
                 c2->fd = backend_fd;
                 c2->peer_fd = client_fd;
                 c2->server_index = server_index;
+                strcpy(c2->client_ip, client_ip);
 
                 struct epoll_event ev1, ev2;
 
@@ -132,7 +208,7 @@ int main() {
                 epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev1);
                 epoll_ctl(epfd, EPOLL_CTL_ADD, backend_fd, &ev2);
 
-                printf("Client → Server %d\n", server_index);
+                printf("Client %s → Server %d\n", client_ip, server_index);
             }
 
             // DATA FORWARDING
@@ -147,6 +223,7 @@ int main() {
                     close(conn->peer_fd);
 
                     servers[conn->server_index].active_connections--;
+                    decrement_rate_limit(conn->client_ip);
                     free(conn);
                     continue;
                 }
@@ -157,6 +234,7 @@ int main() {
                     close(conn->peer_fd);
 
                     servers[conn->server_index].active_connections--;
+                    decrement_rate_limit(conn->client_ip);
                     free(conn);
                 }
             }
